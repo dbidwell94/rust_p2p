@@ -7,9 +7,13 @@ use rocket::{
     State,
 };
 use serde::{Deserialize, Serialize};
+use signal_server::BroadcastCandidateArgs;
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+use webrtc::{
+    ice_transport::ice_candidate::RTCIceCandidate,
+    peer_connection::sdp::session_description::RTCSessionDescription,
+};
 
 fn get_now() -> u64 {
     std::time::SystemTime::now()
@@ -21,12 +25,14 @@ fn get_now() -> u64 {
 #[derive(Debug)]
 struct IceCandidateWithInitTime {
     candidate: Vec<RTCIceCandidate>,
+    session_description: Option<RTCSessionDescription>,
     init_time: u64,
 }
 
 impl Default for IceCandidateWithInitTime {
     fn default() -> Self {
         Self {
+            session_description: None,
             candidate: Vec::new(),
             init_time: get_now(),
         }
@@ -62,7 +68,7 @@ async fn get_room_candidate(
     Ok(Json(candidate.candidate.clone()))
 }
 
-#[get("/allCandidates?<channel>&<room>")]
+#[get("/all_candidates?<channel>&<room>")]
 async fn get_candidates_in_room(
     room_map_state: &State<RoomMap>,
     channel: String,
@@ -87,18 +93,17 @@ async fn get_rooms(
 }
 
 #[post(
-    "/announce?<channel>&<room>&<token>",
+    "/announce?<channel>&<room>&<peer_id>",
     format = "json",
-    data = "<candidate>"
+    data = "<candidate_args>"
 )]
 async fn broadcast_candidate(
     channel: String,
     room: String,
-    token: Option<String>,
-    candidate: Json<Vec<RTCIceCandidate>>,
+    peer_id: String,
+    candidate_args: Json<BroadcastCandidateArgs>,
     room_map_state: &State<RoomMap>,
-) -> Result<String, BadRequest<()>> {
-    let token = token.unwrap_or_else(|| Uuid::new_v4().to_string());
+) -> Result<(), BadRequest<()>> {
     let mut room_map = room_map_state.write().await;
 
     let channel_entry = room_map
@@ -112,20 +117,22 @@ async fn broadcast_candidate(
         .or_insert_with(|| HashMap::new());
 
     let candidate = IceCandidateWithInitTime {
-        candidate: candidate.into_inner(),
+        candidate: candidate_args.candidates.clone(),
         init_time: get_now(),
+        session_description: candidate_args.session_description.clone(),
     };
 
-    println!("Broadcasting candidates: {:?}", candidate);
-
-    let uuid = Uuid::parse_str(token.as_str()).map_err(|_| BadRequest(()))?;
+    let uuid = Uuid::parse_str(peer_id.as_str()).map_err(|_| BadRequest(()))?;
 
     let entry = room_entry
         .entry(uuid)
         .or_insert(IceCandidateWithInitTime::default());
     entry.candidate.extend(candidate.candidate);
+    entry.session_description = candidate.session_description;
 
-    Ok(token)
+    println!("{entry:?}");
+
+    Ok(())
 }
 
 #[launch]

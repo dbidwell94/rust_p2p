@@ -1,133 +1,124 @@
-use crate::signal_server::{SignalServerClient, SignalServerError};
-use std::sync::Arc;
-use thiserror::Error;
+use crate::signal_server::{RoomConfig, SignalServer};
+
+use anyhow::{anyhow, Result as AResult};
+use reqwest::Url;
+use std::{hash::Hash, sync::Arc};
 use tokio::sync::mpsc::channel;
 use uuid::Uuid;
 use webrtc::{
-    data_channel::RTCDataChannel, ice_transport::ice_candidate::RTCIceCandidate,
-    peer_connection::RTCPeerConnection, Error as RTCError,
+    api::API,
+    data_channel::RTCDataChannel,
+    ice_transport::ice_server::RTCIceServer,
+    peer_connection::{configuration::RTCConfiguration, RTCPeerConnection},
 };
-
-#[derive(Error, Debug)]
-pub enum P2PConnectionError {
-    #[error("Failed to create data channel")]
-    P2PConnectionCreationFailed(#[from] RTCError),
-    #[error("The connection attempt was cancelled")]
-    ConnectionCancelled,
-    #[error("Failed to get ICE candidates")]
-    SignalServerError(#[from] SignalServerError),
-}
-
-#[derive(Clone, Debug)]
-pub struct RoomInfo {
-    pub room: String,
-    pub channel: String,
-}
 
 pub struct P2PConnection {
     id: Uuid,
+    connection: RTCPeerConnection,
     data_channel: Arc<RTCDataChannel>,
-    peer_connection: RTCPeerConnection,
+}
+
+impl Hash for P2PConnection {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
 }
 
 impl P2PConnection {
-    pub async fn from_peer_connection(
-        peer_connection: RTCPeerConnection,
-        signal_server_client: Arc<SignalServerClient>,
-        room: RoomInfo,
-    ) -> Result<Self, P2PConnectionError> {
-        let p2p_id = Uuid::new_v4();
+    pub(crate) async fn from_api(ice_connections: &[String], api: Arc<API>) -> AResult<Self> {
+        let config = RTCConfiguration {
+            ice_servers: vec![RTCIceServer {
+                urls: ice_connections.to_vec(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
 
-        let data_channel = peer_connection
-            .create_data_channel(&format!("data-channel-{p2p_id}"), None)
+        let id = Uuid::new_v4();
+
+        let connection = api.new_peer_connection(config).await?;
+        let data_channel = connection
+            .create_data_channel(&format!("data{id}"), None)
             .await?;
 
-        let (tx_connection_state, rx_connection_state) = channel(2);
-
-        peer_connection.on_peer_connection_state_change(Box::new(move |state| {
-            let _ = tx_connection_state.try_send(state);
-
-            Box::pin(async {})
-        }));
-
-        let offer = peer_connection.create_offer(None).await?;
-        peer_connection.set_local_description(offer).await?;
-
-        Self::announce_ice_candidates(
-            &peer_connection,
-            &signal_server_client,
-            p2p_id.to_string(),
-            &room,
-        )
-        .await?;
-
-        // TODO send the candidates to the other peer
-        todo!("Finish this implementation");
-
         Ok(Self {
-            id: p2p_id,
-            data_channel: data_channel,
-            peer_connection,
+            id: Uuid::new_v4(),
+            connection,
+            data_channel,
         })
     }
 
-    async fn announce_ice_candidates(
-        peer_connection: &RTCPeerConnection,
-        signal_server_client: &Arc<SignalServerClient>,
-        p2p_id: String,
-        room_info: &RoomInfo,
-    ) -> Result<(), P2PConnectionError> {
-        // Create a channel to receive ICE candidates. Set the buffer to 2 to ensure that we don't accidentally miss a candidate.
-        let (tx_ice_candidates, mut rx_ice_candidates) = channel(2);
+    pub(crate) async fn broadcast_offer(
+        &self,
+        signal_server_url: Url,
+        room_config: RoomConfig,
+    ) -> AResult<()> {
+        let connection = &self.connection;
 
-        peer_connection.on_ice_candidate(Box::new(move |candidate| {
-            let _ = tx_ice_candidates.try_send(candidate);
+        let offer = connection.create_offer(None).await?;
+        connection.set_local_description(offer).await?;
+
+        let (tx, mut rx) = channel(2);
+        connection.on_ice_candidate(Box::new(move |candidate| {
+            let _ = tx.try_send(candidate);
 
             Box::pin(async {})
         }));
 
-        // Init this to 5 to prevent reallocation. ICE candidates are usually around 5.
-        let mut found_candidates: Vec<RTCIceCandidate> = Vec::with_capacity(5);
+        let mut candidates = Vec::new();
 
-        // In this first branch, a `None` means that the tx_ice_candidates channel was closed
-        while let Some(candidate) = rx_ice_candidates.recv().await {
-            // In this branch, a `None` means that the ICE traversal is complete. We want the latest candidate.
+        while let Some(candidate) = rx.recv().await {
             if let Some(candidate) = candidate {
-                found_candidates.push(candidate);
+                candidates.push(candidate);
             } else {
                 break;
             }
         }
 
-        signal_server_client
-            .announce_self(
-                &room_info.channel,
-                &room_info.room,
-                &p2p_id,
-                &found_candidates,
+        let local_description = connection.local_description().await.ok_or(anyhow!(
+            "Failed to get local description for the connection"
+        ))?;
+
+        let signal_server = SignalServer::new(signal_server_url, room_config);
+
+        signal_server
+            .broadcast_self(
+                self.id.to_string(),
+                &local_description,
+                candidates.iter().map(|c| c.to_owned()).collect(),
             )
             .await?;
 
         Ok(())
     }
-
-    async fn look_for_ice_candidates(
-        peer_connection: &RTCPeerConnection,
-        signal_server_client: &Arc<SignalServerClient>,
-        p2p_id: String,
-        room_info: &RoomInfo,
-    ) -> Result<Vec<RTCIceCandidate>, P2PConnectionError> {
-        let candidates = signal_server_client
-            .get_candidates_in_room(&room_info.channel, &room_info.room)
-            .await?;
-
-        Ok(candidates)
-    }
 }
 
-impl Drop for P2PConnection {
-    fn drop(&mut self) {
-        let _ = self.data_channel.close();
-        let _ = self.peer_connection.close();
+#[cfg(test)]
+mod test {
+    use super::*;
+    use lazy_static::lazy_static;
+    use webrtc::api::APIBuilder;
+
+    lazy_static! {
+        static ref ICE_SERVERS: Vec<String> = vec!["stun:stun.l.google.com:19302".to_string()];
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_offer() -> AResult<()> {
+        let api = Arc::new(APIBuilder::new().build());
+
+        let connection = P2PConnection::from_api(&ICE_SERVERS, api).await.unwrap();
+
+        connection
+            .broadcast_offer(
+                Url::parse("http://localhost:8000").unwrap(),
+                RoomConfig {
+                    room: "my_room".into(),
+                    channel: "my_channel".into(),
+                },
+            )
+            .await?;
+
+        Ok(())
     }
 }

@@ -1,106 +1,119 @@
-use crate::{p2p_connection::RoomInfo, signal_server::SignalServerClient};
-
-use super::p2p_connection::P2PConnection;
-use anyhow::Result as AResult;
+use crate::{p2p_connection::P2PConnection, signal_server::RoomConfig};
+use anyhow::{anyhow, Result as AResult};
 use reqwest::Url;
-use std::sync::Arc;
-use tokio::{
-    select,
-    sync::mpsc::{channel, Receiver},
-    task::JoinHandle,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
+    u16,
 };
-pub use tokio_util::sync::CancellationToken;
-use webrtc::{
-    api::{APIBuilder, API},
-    ice_transport::ice_server::RTCIceServer,
-    peer_connection::configuration::RTCConfiguration,
-};
+use tokio::task::JoinHandle;
+use webrtc::api::APIBuilder;
 
 pub struct P2PClient {
-    api: Arc<API>,
-    connection_listen_handle: Option<JoinHandle<AResult<()>>>,
-    connection_cancellation_token: Option<CancellationToken>,
-    signal_server_client: Arc<SignalServerClient>,
-    room_info: RoomInfo,
+    ice_servers: Vec<String>,
+    max_connections: u16,
+    has_pending_connection: Arc<AtomicBool>,
+    active_connections: Arc<RwLock<Vec<P2PConnection>>>,
+    connection_listener_handle: Option<JoinHandle<AResult<()>>>,
+    rtc_api: Arc<webrtc::api::API>,
+    signal_server_url: Url,
 }
 
 impl P2PClient {
-    pub fn new(signal_server_url: &Url, room_info: RoomInfo) -> Self {
-        let api_url: Url = signal_server_url.clone();
-
-        let api = APIBuilder::new().build();
-        Self {
-            api: Arc::new(api),
-            connection_listen_handle: None,
-            connection_cancellation_token: None,
-            signal_server_client: Arc::new(SignalServerClient::new(api_url)),
-            room_info,
-        }
-    }
-
-    pub fn finish_listen_for_connections(&mut self) {
-        if let Some(cancellation_token) = self.connection_cancellation_token.take() {
-            cancellation_token.cancel();
-        }
-
-        if let Some(handle) = self.connection_listen_handle.take() {
-            handle.abort();
-        }
-    }
-
-    pub fn listen_for_connections(
-        &mut self,
-        ice_servers: Vec<String>,
-        cancellation_token: CancellationToken,
-    ) -> AResult<Receiver<P2PConnection>> {
-        let api = self.api.clone();
-        let cancellation_token_to_store = cancellation_token.clone();
-
-        let (tx, rx) = channel(1);
-
-        let cloned_signal_server_client = self.signal_server_client.clone();
-        let room_info = self.room_info.clone();
-        let join_handle: JoinHandle<AResult<()>> = tokio::task::spawn(async move {
+    /// Accept a single connection from the signaling server
+    pub fn accept_connections(&mut self, room_config: RoomConfig) -> AResult<()> {
+        let ice_servers = self.ice_servers.clone();
+        let api = self.rtc_api.clone();
+        let has_pending_connection = self.has_pending_connection.clone();
+        let active_connections = self.active_connections.clone();
+        let max_connections = self.max_connections.clone();
+        let signal_server_url = self.signal_server_url.clone();
+        let handle: JoinHandle<AResult<()>> = tokio::spawn(async move {
             loop {
-                let child_token = cancellation_token.child_token();
-                let peer_connection = api
-                    .new_peer_connection(RTCConfiguration {
-                        ice_servers: vec![RTCIceServer {
-                            urls: ice_servers.clone(),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    })
+                let connection = P2PConnection::from_api(&ice_servers, api.clone()).await?;
+                has_pending_connection.store(true, Ordering::Relaxed);
+
+                connection
+                    .broadcast_offer(signal_server_url.clone(), room_config.clone())
                     .await?;
 
-                select! {
-                    _ = child_token.cancelled() => {
-                        break;
-                    }
-                    connection = P2PConnection::from_peer_connection(peer_connection, cloned_signal_server_client.clone(), room_info.clone()) => {
-                        tx.send(connection?).await?;
-                    }
-                };
+                let active_connection_count;
+                // Aquire the write lock and immediately release
+                {
+                    let mut active_connections = active_connections.write().map_err(|_| {
+                        anyhow!("Unable to aquire write lock for the active connections")
+                    })?;
+
+                    active_connections.push(connection);
+                    active_connection_count = active_connections.len();
+                }
+
+                // check to ensure the active connection count is less than the max connections, or else break
+                if active_connection_count >= max_connections as usize {
+                    break;
+                }
             }
 
             Ok(())
         });
+        self.connection_listener_handle = Some(handle);
 
-        self.connection_listen_handle = Some(join_handle);
-        self.connection_cancellation_token = Some(cancellation_token_to_store);
+        Ok(())
+    }
 
-        Ok(rx)
+    pub fn has_pending_connection(&self) -> AResult<bool> {
+        let has_connections = self.has_pending_connection.load(Ordering::Relaxed);
+
+        Ok(has_connections)
+    }
+
+    pub fn active_connections_count(&self) -> AResult<usize> {
+        Ok(self
+            .active_connections
+            .read()
+            .map_err(|_| anyhow!("Unable to aquire read lock"))?
+            .len())
     }
 }
 
-impl Drop for P2PClient {
-    fn drop(&mut self) {
-        if let Some(cancellation_token) = self.connection_cancellation_token.take() {
-            cancellation_token.cancel();
-        }
+pub struct P2PClientBuilder {
+    ice_servers: Vec<String>,
+    max_connections: u16,
+    signal_server_url: Url,
+}
 
-        if let Some(handle) = self.connection_listen_handle.take() {
-            handle.abort();
+impl P2PClientBuilder {
+    pub fn new(signal_server_url: Url) -> Self {
+        Self {
+            ice_servers: Vec::new(),
+            max_connections: u16::MAX,
+            signal_server_url,
+        }
+    }
+
+    pub fn with_ice_servers(mut self, ice_servers: Vec<String>) -> Self {
+        self.ice_servers = ice_servers;
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: u16) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+
+    pub fn build(self) -> P2PClient {
+        let api = Arc::new(APIBuilder::new().build());
+
+        P2PClient {
+            ice_servers: self.ice_servers,
+            max_connections: self.max_connections,
+            has_pending_connection: Arc::new(AtomicBool::new(false)),
+            active_connections: Arc::new(RwLock::new(Vec::new())),
+            connection_listener_handle: None,
+            rtc_api: api,
+            signal_server_url: self.signal_server_url,
         }
     }
 }
@@ -109,35 +122,21 @@ impl Drop for P2PClient {
 mod test {
     use super::*;
 
-    lazy_static::lazy_static! {
-        static ref SIGNAL_SERVER_URL: Url = Url::parse("http://localhost:8000").unwrap();
-    }
+    lazy_static::lazy_static!(
+        static ref SIGNAL_SERVER_URL: Url = "http://localhost:8000".try_into().unwrap();
+    );
 
-    #[tokio::test]
-    async fn test_p2p_client() -> AResult<()> {
-        let mut client = P2PClient::new(
-            &SIGNAL_SERVER_URL,
-            RoomInfo {
-                channel: "test".to_string(),
-                room: "test".to_string(),
-            },
+    #[test]
+    fn test_builder() {
+        let client = P2PClientBuilder::new(SIGNAL_SERVER_URL.clone())
+            .with_ice_servers(vec!["stun:stun.l.google.com:19302".to_string()])
+            .with_max_connections(10)
+            .build();
+
+        assert_eq!(
+            client.ice_servers,
+            vec!["stun:stun.l.google.com:19302".to_string()]
         );
-
-        let ice_servers = vec!["stun:stun.l.google.com:19302".to_string()];
-
-        let cancellation_token = CancellationToken::new();
-
-        let mut connection_receiver =
-            client.listen_for_connections(ice_servers, cancellation_token.child_token())?;
-
-        // tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // cancellation_token.cancel();
-
-        while let Some(_) = connection_receiver.recv().await {
-            println!("Received connection");
-        }
-
-        Ok(())
+        assert_eq!(client.max_connections, 10);
     }
 }

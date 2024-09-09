@@ -1,77 +1,60 @@
-use reqwest::{Client, Url};
-use thiserror::Error;
-use uuid::Uuid;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+use anyhow::Result as AResult;
+use reqwest::Url;
+use signal_server::BroadcastCandidateArgs;
+use webrtc::{
+    ice_transport::ice_candidate::RTCIceCandidate,
+    peer_connection::sdp::session_description::RTCSessionDescription,
+};
 
-#[derive(Error, Debug)]
-pub enum SignalServerError {
-    #[error(transparent)]
-    ApiError(#[from] reqwest::Error),
-    #[error("An unknown error has occurred")]
-    GeneralError,
+#[derive(Debug, Clone)]
+pub struct RoomConfig {
+    pub room: String,
+    pub channel: String,
 }
 
-pub struct SignalServerClient {
-    api_client: Client,
-    base_url: Url,
+pub struct SignalServer {
+    url: Url,
+    room_config: RoomConfig,
+    client: reqwest::Client,
 }
 
-impl SignalServerClient {
-    pub fn new(server_url: Url) -> Self {
+impl SignalServer {
+    pub fn new(url: Url, room_config: RoomConfig) -> Self {
+        let client = reqwest::Client::new();
+
         Self {
-            api_client: Client::new(),
-            base_url: server_url,
+            url,
+            room_config,
+            client,
         }
     }
 
-    pub async fn announce_self(
+    pub async fn broadcast_self(
         &self,
-        channel: &str,
-        room: &str,
-        p2p_id: &str,
-        ice_candidate: &[RTCIceCandidate],
-    ) -> Result<(), SignalServerError> {
-        let url = self
-            .base_url
-            .join(&format!("/announce"))
-            .map_err(|_| SignalServerError::GeneralError)?;
+        peer_id: String,
+        session_description: &RTCSessionDescription,
+        ice_candidates: Vec<RTCIceCandidate>,
+    ) -> AResult<()> {
+        let url = self.url.join("/announce")?;
 
-        let query = vec![("channel", channel), ("room", room), ("token", p2p_id)];
+        let query = vec![
+            ("channel", self.room_config.channel.as_str()),
+            ("room", self.room_config.room.as_str()),
+            ("peer_id", peer_id.as_str()),
+        ];
 
-        self.api_client
+        let body = BroadcastCandidateArgs {
+            candidates: ice_candidates,
+            session_description: Some(session_description.clone()),
+        };
+
+        self.client
             .post(url)
             .query(&query)
-            .json(ice_candidate)
+            .json(&body)
             .send()
             .await?;
 
         Ok(())
-    }
-
-    pub async fn get_candidates_in_room(
-        &self,
-        channel: &str,
-        room: &str,
-    ) -> Result<Vec<Uuid>, SignalServerError> {
-        let url = self
-            .base_url
-            .join(&format!("/allCandidates"))
-            .map_err(|_| SignalServerError::GeneralError)?;
-
-        let query = vec![("channel", channel), ("room", room)];
-
-        let response = self
-            .api_client
-            .get(url)
-            .query(&query)
-            .send()
-            .await?
-            .json::<Vec<String>>()
-            .await?
-            .iter()
-            .flat_map(|v| Uuid::parse_str(v))
-            .collect::<Vec<_>>();
-
-        Ok(response)
     }
 }

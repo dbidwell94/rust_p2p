@@ -2035,6 +2035,7 @@ dependencies = [
  "anyhow",
  "lazy_static",
  "reqwest",
+ "signal_server",
  "thiserror",
  "tokio",
  "tokio-util",
