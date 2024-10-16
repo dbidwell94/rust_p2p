@@ -1,123 +1,168 @@
-use crate::signal_server::{RoomConfig, SignalServer};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 
+use crate::p2p_client::{IntoId, P2PClient};
 use anyhow::{anyhow, Result as AResult};
-use reqwest::Url;
-use std::{hash::Hash, sync::Arc};
-use tokio::sync::mpsc::channel;
-use uuid::Uuid;
-use webrtc::{
-    api::API,
-    data_channel::RTCDataChannel,
-    ice_transport::ice_server::RTCIceServer,
-    peer_connection::{configuration::RTCConfiguration, RTCPeerConnection},
-};
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 
-pub struct P2PConnection {
-    id: Uuid,
+pub struct P2PConnection<'a> {
     connection: RTCPeerConnection,
     data_channel: Arc<RTCDataChannel>,
+    local_id: &'a Box<dyn IntoId>,
+    remote_id: Option<Box<dyn IntoId>>,
+    message_reciever: Receiver<DataChannelMessage>,
 }
 
-impl Hash for P2PConnection {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
-
-impl P2PConnection {
-    pub(crate) async fn from_api(ice_connections: &[String], api: Arc<API>) -> AResult<Self> {
+impl<'a> P2PConnection<'a> {
+    /// Creates a new `P2PConnection` from a `&P2PClient`.
+    /// This is an async function, and expects the client to have at least one valid STUN server
+    /// already setup
+    pub async fn new(client: &'a P2PClient<'a>) -> AResult<Self> {
         let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: ice_connections.to_vec(),
-                ..Default::default()
-            }],
+            ice_servers: client
+                .ice_servers
+                .clone()
+                .into_iter()
+                .map(|server| RTCIceServer {
+                    urls: vec![server],
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
             ..Default::default()
         };
 
-        let id = Uuid::new_v4();
-
-        let connection = api.new_peer_connection(config).await?;
+        let connection = client.api.new_peer_connection(config).await?;
         let data_channel = connection
-            .create_data_channel(&format!("data{id}"), None)
+            .create_data_channel(&format!("data_channel_{}", client.id.id()), None)
             .await?;
 
-        Ok(Self {
-            id: Uuid::new_v4(),
-            connection,
-            data_channel,
-        })
-    }
+        let (sx, rx) = channel();
 
-    pub(crate) async fn broadcast_offer(
-        &self,
-        signal_server_url: Url,
-        room_config: RoomConfig,
-    ) -> AResult<()> {
-        let connection = &self.connection;
+        let id = client.id.id();
+        data_channel.on_message(Box::new(move |msg| {
+            let _ = sx.send(msg);
+            Box::pin(async {})
+        }));
 
-        let offer = connection.create_offer(None).await?;
-        connection.set_local_description(offer).await?;
-
-        let (tx, mut rx) = channel(2);
-        connection.on_ice_candidate(Box::new(move |candidate| {
-            let _ = tx.try_send(candidate);
+        data_channel.on_open(Box::new(|| {
+            println!("Data channel has opened");
 
             Box::pin(async {})
         }));
 
-        let mut candidates = Vec::new();
+        connection.on_negotiation_needed(Box::new(move || {
+            println!("need on_negotiation_needed: {0}", id);
 
-        while let Some(candidate) = rx.recv().await {
-            if let Some(candidate) = candidate {
-                candidates.push(candidate);
-            } else {
-                break;
-            }
-        }
+            Box::pin(async {})
+        }));
 
-        let local_description = connection.local_description().await.ok_or(anyhow!(
-            "Failed to get local description for the connection"
-        ))?;
+        connection.on_peer_connection_state_change(Box::new(|state| {
+            println!("{state:?}");
+            Box::pin(async {})
+        }));
 
-        let signal_server = SignalServer::new(signal_server_url, room_config);
+        Ok(Self {
+            local_id: &client.id,
+            data_channel,
+            connection,
+            remote_id: None,
+            message_reciever: rx,
+        })
+    }
 
-        signal_server
-            .broadcast_self(
-                self.id.to_string(),
-                &local_description,
-                candidates.iter().map(|c| c.to_owned()).collect(),
-            )
-            .await?;
+    /// Gets the offer for use with the signaling server
+    pub(crate) async fn get_offer(&self) -> AResult<RTCSessionDescription> {
+        let offer = self.connection.create_offer(None).await?;
+        self.connection.set_local_description(offer).await?;
 
+        let mut recv = self.connection.gathering_complete_promise().await;
+        let _ = recv.recv().await;
+
+        let local_description = self
+            .connection
+            .local_description()
+            .await
+            .ok_or(anyhow!("Unable to get local description"))?;
+
+        Ok(local_description)
+    }
+
+    pub async fn set_remote_offer(&self, offer: RTCSessionDescription) -> AResult<()> {
+        self.connection.set_remote_description(offer).await?;
         Ok(())
+    }
+
+    /// Used to set the remote answer to the connection
+    pub(crate) async fn get_answer(
+        &self,
+        offer: RTCSessionDescription,
+    ) -> AResult<RTCSessionDescription> {
+        self.connection.set_remote_description(offer).await?;
+
+        let answer = self.connection.create_answer(None).await?;
+
+        let mut recv = self.connection.gathering_complete_promise().await;
+
+        self.connection.set_local_description(answer).await?;
+
+        let _ = recv.recv().await;
+
+        let local_description = self
+            .connection
+            .local_description()
+            .await
+            .ok_or(anyhow!("Unable to get local description"))?;
+
+        Ok(local_description)
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use lazy_static::lazy_static;
-    use webrtc::api::APIBuilder;
+    use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 
-    lazy_static! {
-        static ref ICE_SERVERS: Vec<String> = vec!["stun:stun.l.google.com:19302".to_string()];
+    const STUN_SERVERS: [&str; 1] = ["stun:stun.l.google.com:19302"];
+
+    #[tokio::test]
+    async fn test_new_p2p_connection() -> AResult<()> {
+        let client = P2PClient::new(STUN_SERVERS);
+        let _ = P2PConnection::new(&client).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_broadcast_offer() -> AResult<()> {
-        let api = Arc::new(APIBuilder::new().build());
+    async fn test_get_local_description() -> AResult<()> {
+        let client = P2PClient::new(STUN_SERVERS);
+        let connection = P2PConnection::new(&client).await?;
 
-        let connection = P2PConnection::from_api(&ICE_SERVERS, api).await.unwrap();
+        let offer = connection.get_offer().await?;
+        assert_eq!(offer.sdp_type, RTCSdpType::Offer);
+        Ok(())
+    }
 
-        connection
-            .broadcast_offer(
-                Url::parse("http://localhost:8000").unwrap(),
-                RoomConfig {
-                    room: "my_room".into(),
-                    channel: "my_channel".into(),
-                },
-            )
-            .await?;
+    #[tokio::test]
+    async fn test_offer_answer() -> AResult<()> {
+        let mut client1 = P2PClient::default();
+        client1.id = Box::new("client1".to_owned());
+        let mut client2 = P2PClient::default();
+        client2.id = Box::new("client2".to_owned());
+
+        let connection1 = P2PConnection::new(&client1).await?;
+        let connection2 = P2PConnection::new(&client2).await?;
+
+        let offer = connection1.get_offer().await?;
+        assert_eq!(offer.sdp_type, RTCSdpType::Offer);
+
+        let answer = connection2.get_answer(offer).await?;
+        assert_eq!(answer.sdp_type, RTCSdpType::Answer);
+
+        connection1.set_remote_offer(answer).await?;
 
         Ok(())
     }
