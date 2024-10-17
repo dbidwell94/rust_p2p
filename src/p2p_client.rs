@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Debug};
 use uuid::Uuid;
 use webrtc::api::{APIBuilder, API};
 
-pub(crate) trait IntoId: Debug {
+pub(crate) trait IntoId {
     fn id(&self) -> String;
 }
 

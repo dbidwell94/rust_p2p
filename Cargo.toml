@@ -16,8 +16,9 @@ reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1.10", features = ["v4"] }
 webrtc = { workspace = true }
 signal_server = { path = "./signal_server" }
+tokio = "1.40"
+futures = { version = "0.3", features = ["executor"] }
 
 [dev-dependencies]
-tokio = "1.40"
 serde_json = { version = "1.0" }
 lazy_static = "1.5"

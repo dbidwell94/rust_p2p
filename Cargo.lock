@@ -2012,6 +2012,7 @@ name = "rust_p2p"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "lazy_static",
  "reqwest",
  "serde_json",
